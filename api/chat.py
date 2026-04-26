@@ -16,8 +16,8 @@ EMBEDDINGS_PATH = ROOT / "data" / "embeddings.json"
 
 EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o"
-TOP_K = 4
-SIMILARITY_THRESHOLD = 0.22
+TOP_K = 6
+SIMILARITY_THRESHOLD = 0.18
 
 REFUSAL = (
     "죄송합니다. 저는 욕창(Pressure Injury) 예측 모델 자료에 기반한 질문에만 "
@@ -33,7 +33,9 @@ SYSTEM_PROMPT = """당신은 욕창(Pressure Injury) 예측 모델에 대해 안
 2. 답변 주제는 다음으로 한정합니다: 욕창(Pressure Injury), 예측 모델의 알고리즘/성능/검증, 입력 변수(RASS, 하지 근력, 체온, 실금 등), 모델 사용법, 데이터/연구 방법론, 웹 애플리케이션 동작.
 3. 위 주제와 관련 없는 질문(일상 대화, 다른 의학 주제, 일반 상식, 코딩 일반론 등)에는 정중히 거절하세요: "죄송합니다. 저는 욕창 예측 모델 관련 질문에만 답변할 수 있습니다."
 4. 답변은 한국어로, 임상/연구 맥락에 맞춰 정확하고 간결하게 작성하세요. 수치는 컨텍스트에 명시된 값을 그대로 인용하세요.
-5. 의학적 진단/처방을 직접 내리지 말고, 모델 결과는 참고용임을 필요 시 안내하세요.
+5. 변수 이름은 자료에 표기된 한국어 명칭을 그대로 쓰세요(예: "RASS 평균값", "motor strength LE 평균", "체온(최대)", "체온(최소)", "하루평균실금"). 코드 변수명(예: rass_mean) 형식으로 임의 변환하지 마세요.
+6. 사용자가 "그럼?", "왜?", "더 있어?" 같이 짧은 후속 질문을 하면 직전까지의 대화 맥락을 고려해 답하세요. 맥락상 명백히 욕창 모델 관련이면 거절하지 말고 답변하세요.
+7. 의학적 진단/처방을 직접 내리지 말고, 모델 결과는 참고용임을 필요 시 안내하세요.
 """
 
 
@@ -72,6 +74,30 @@ def _last_user_message(messages: list[dict]) -> str | None:
     return None
 
 
+def _build_retrieval_query(messages: list[dict]) -> str:
+    """Combine the last user turn with prior context so short follow-ups
+    ("그럼?", "왜?", "더 있어?") still retrieve relevant chunks.
+    """
+    last_user = _last_user_message(messages) or ""
+    prior_user = ""
+    seen_last = False
+    for m in reversed(messages):
+        if m.get("role") != "user" or not m.get("content"):
+            continue
+        if not seen_last:
+            seen_last = True
+            continue
+        prior_user = m["content"]
+        break
+    last_assistant = ""
+    for m in reversed(messages):
+        if m.get("role") == "assistant" and m.get("content"):
+            last_assistant = m["content"]
+            break
+    parts = [p for p in (prior_user, last_assistant[:400], last_user) if p]
+    return "\n".join(parts) if parts else last_user
+
+
 def _generate_reply(messages: list[dict]) -> str:
     user_query = _last_user_message(messages)
     if not user_query:
@@ -79,7 +105,8 @@ def _generate_reply(messages: list[dict]) -> str:
 
     client = OpenAI()
 
-    emb = client.embeddings.create(model=EMBED_MODEL, input=user_query).data[0].embedding
+    retrieval_query = _build_retrieval_query(messages)
+    emb = client.embeddings.create(model=EMBED_MODEL, input=retrieval_query).data[0].embedding
     top = _retrieve(emb, TOP_K)
     best_score = top[0][0] if top else 0.0
 
